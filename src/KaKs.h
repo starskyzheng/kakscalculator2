@@ -26,6 +26,40 @@
 #include "MYN.h"
 #include "MSMA.h"
 
+// Forward declarations for parallel computation
+struct SeqPair {
+	string name;
+	string seq1;
+	string seq2;
+	string full_seq;
+};
+
+struct CalcResult {
+	int index;
+	string name;
+	string result;
+	bool success;
+};
+// Undefine min/max macros before including C++ standard headers
+// to avoid conflicts with std::min/std::max
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <queue>
+#include <algorithm>
+#include <memory>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <fstream>
+#include <sstream>
+
 using namespace std;
 
 /* KAKS class */
@@ -79,6 +113,12 @@ protected:
 	bool checkValid(string name, string str1, string str2);
 	/* Parse the input parameters */
 	bool parseParameter(int argc, const char* argv[]);
+	/* Process a single sequence pair (for parallel computation) - wrapper for compatibility */
+	void processSeqPair(const void* pair_ptr, int thread_id);
+	/* Internal function to process a sequence pair and return result */
+	CalcResult processSeqPairInternal(const SeqPair& pair, int thread_id);
+	/* Process child task (for multi-process mode) */
+	void processChildTask(const string& input_file, const string& output_file, int process_id);
 	/* Show input parameters' information on screen */
 	void showParaInfo();
 	/* Get title information for writing into file */
@@ -104,12 +144,27 @@ public:
 	bool none, ng86,gng86, lwl85,glwl85, lpb93,glpb93, yn00,gyn00, mlwl85, gmlwl85,mlpb93,gmlpb93, gy94, myn, ms, ma,gmyn;	
 	/* Number of compared pairwise sequences */
 	unsigned long number;	//Maybe too many
+	
+	/* Number of threads for parallel computation */
+	int num_threads;
+	/* Verbose mode: output each pair information */
+	bool verbose;
 
 protected:
 	/* File name for detailed results for model selection */
 	string detail_filename;
 	/* Detailed results */
-	string details; 
+	string details;
+	
+	/* Mutex for thread-safe output */
+	mutable mutex output_mutex;
+	/* Mutex for task queue */
+	mutable mutex task_mutex;
+	/* Mutex for result collection */
+	mutable mutex result_mutex;
+	/* Array of mutexes for parallel calculation - each thread uses a different mutex */
+	/* Using unique_ptr because mutex is not copyable/movable */
+	mutable vector<unique_ptr<mutex>> calc_mutexes; 
 	
 private:
 	/* The temporary results for write into file */

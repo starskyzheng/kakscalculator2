@@ -24,6 +24,14 @@
 #else
     #include <cstring>
 #endif
+#include <atomic>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <cstdlib>
+#include <sstream>
+
+// Structures are now defined in KaKs.h
 
 KAKS::KAKS() {
 
@@ -101,7 +109,12 @@ none = ng86 =gng86= lpb93 =glpb93= lwl85=glwl85 = mlwl85 =gmlwl85= mlpb93 =gmlpb
 	seq_filename = output_filename = detail_filename = "";
 	result = details = "";
 	genetic_code = 1;
-	number = 0;	
+	number = 0;
+	num_threads = 1;  // Default to single thread
+	verbose = false;  // Default to non-verbose mode
+	
+	// Initialize calculation mutexes (will be resized when num_threads is set)
+	calc_mutexes.clear();
 
 	return 1;
 }
@@ -141,7 +154,287 @@ void KAKS::getGCContent(string str) {
 * Return Value: True if succeed, otherwise false.
  
 * Note: Using axt file for low memory
-*****************************************************/
+* Modified: Added parallel computation support
+****************************************************/
+
+// Worker function for parallel computation - processes a single sequence pair
+CalcResult KAKS::processSeqPairInternal(const SeqPair& pair, int thread_id) {
+	CalcResult calc_result;
+	calc_result.index = -1;
+	calc_result.success = false;
+	calc_result.result = "";
+	
+	try {
+		// Create a local copy of sequences for this thread
+		string local_seq1 = pair.seq1;
+		string local_seq2 = pair.seq2;
+		string local_name = pair.name;
+		string local_full_seq = pair.full_seq;
+		
+		// Calculate GC content locally (without modifying global GC)
+		double local_GC[4] = {0, 0, 0, 0};
+		int i, j;
+		for(i=0; i<local_full_seq.length(); i+=3) {
+			string codon = local_full_seq.substr(i, 3);
+			for(j=0; j<3; j++) {
+				if(codon[j]=='G' || codon[j]=='C') local_GC[j+1]++;
+			}
+		}
+		local_GC[0] = (local_GC[1] + local_GC[2] + local_GC[3]) / local_full_seq.length();
+		for(i=1; i<4; i++) local_GC[i] /= (local_full_seq.length()/3);
+		
+		// Check validity locally (modify copies, not originals)
+		string valid_seq1 = local_seq1;
+		string valid_seq2 = local_seq2;
+		bool valid = true;
+		long idx;
+		
+		try {
+			if (valid_seq1.length() != valid_seq2.length() || valid_seq1.length()%3!=0 || valid_seq2.length()%3!=0) {
+				valid = false;
+			} else {
+				bool found;
+				int j;
+				for(idx=0; idx<valid_seq1.length(); idx+=3) {
+					for(found=false, j=0; j<3 && !found; j++) {
+						if (valid_seq1[idx+j]=='-' || valid_seq2[idx+j]=='-') {
+							found = true;
+						}
+						valid_seq1[idx+j] = toupper(valid_seq1[idx+j]);
+						valid_seq2[idx+j] = toupper(valid_seq2[idx+j]);
+						if (convertChar(valid_seq1[idx+j])==-1 || convertChar(valid_seq2[idx+j])==-1) {
+							found = true;
+						}
+					}
+					if ((getAminoAcid(valid_seq1.substr(idx,3))=='!') || (getAminoAcid(valid_seq2.substr(idx,3))=='!')) {
+						found = true;
+					}
+					if (found) {
+						valid_seq1 = valid_seq1.replace(idx, 3, "");
+						valid_seq2 = valid_seq2.replace(idx, 3, "");
+						idx -= 3;
+					}
+				}
+				if (valid_seq1.length() == 0) valid = false;
+			}
+		} catch (...) {
+			valid = false;
+		}
+		
+		// Perform calculation with lock (set globals, calculate, get result, restore)
+		unsigned long local_length = valid_seq1.length();
+		
+		if (valid) {
+			// Use thread-specific mutex for true parallelism
+			mutex& calc_mutex = (calc_mutexes.size() > 0) ? 
+				*calc_mutexes[thread_id % calc_mutexes.size()] : 
+				output_mutex;
+			
+			// Set globals and calculate (needs lock because globals are shared)
+			{
+				lock_guard<mutex> lock(calc_mutex);
+				
+				// Save originals
+				double orig_GC[4];
+				unsigned long orig_length;
+				string orig_seq_name_global;
+				int orig_genetic_code;
+				string orig_seq1 = seq1;
+				string orig_seq2 = seq2;
+				string orig_seq_name = seq_name;
+				
+				for(int i = 0; i < 4; i++) orig_GC[i] = GC[i];
+				orig_length = length;
+				orig_seq_name_global = seq_name;
+				orig_genetic_code = genetic_code;  // Save genetic_code
+				
+				// Set values for this calculation
+				for(int i = 0; i < 4; i++) GC[i] = local_GC[i];
+				length = local_length;
+				seq_name = local_name;
+				// genetic_code is set in parseParameter and should not change during calculation
+				// But we save/restore it for safety
+				seq1 = valid_seq1;
+				seq2 = valid_seq2;
+				
+				// Close os to prevent calculateKaKs from writing
+				if (os.is_open()) {
+					os.close();
+				}
+				
+				result = "";
+				
+				// Perform calculation
+				calc_result.success = calculateKaKs();
+				calc_result.result = result;
+				
+				// Restore originals
+				for(int i = 0; i < 4; i++) GC[i] = orig_GC[i];
+				length = orig_length;
+				seq_name = orig_seq_name_global;
+				genetic_code = orig_genetic_code;  // Restore genetic_code
+				seq1 = orig_seq1;
+				seq2 = orig_seq2;
+			}
+			
+			calc_result.name = local_name;
+		}
+	}
+	catch (const exception& e) {
+		calc_result.success = false;
+		calc_result.name = pair.name;
+		if (verbose) {
+			lock_guard<mutex> lock(output_mutex);
+			cout << "Error processing sequence pair: " << pair.name << " - " << e.what() << endl;
+		}
+	}
+	catch (...) {
+		calc_result.success = false;
+		calc_result.name = pair.name;
+		if (verbose) {
+			lock_guard<mutex> lock(output_mutex);
+			cout << "Error processing sequence pair: " << pair.name << endl;
+		}
+	}
+	
+	return calc_result;
+}
+
+// Worker function for parallel computation - wrapper for compatibility
+void KAKS::processSeqPair(const void* pair_ptr, int thread_id) {
+	// This function is no longer used in the new design
+	// Kept for compatibility but should not be called
+}
+
+// Process child task - reads input file, processes sequences, writes output file
+void KAKS::processChildTask(const string& input_file, const string& output_file, int process_id) {
+	try {
+		// Read input file
+		ifstream input_stream(input_file.c_str());
+		if (!input_stream.is_open()) {
+			cerr << "Error: Could not open input file " << input_file << endl;
+			return;
+		}
+		
+		// Open output file
+		ofstream output_stream(output_file.c_str());
+		if (!output_stream.is_open()) {
+			cerr << "Error: Could not open output file " << output_file << endl;
+			input_stream.close();
+			return;
+		}
+		
+		// Read and process sequence pairs (same format as axt file)
+		vector<SeqPair> local_seq_pairs;
+		string temp="", name="", str="";
+		
+		while (getline(input_stream, temp, '\n')) {
+			if (temp.empty()) continue;
+			name = temp;
+			
+			getline(input_stream, temp, '\n');
+			str = "";
+			while (temp!="" && !input_stream.eof()) {
+				str += temp;
+				getline(input_stream, temp, '\n');
+			}
+			
+			if (str.length() > 0) {
+				SeqPair pair;
+				pair.name = name;
+				pair.full_seq = str;
+				pair.seq1 = str.substr(0, str.length()/2);
+				pair.seq2 = str.substr(str.length()/2, str.length()/2);
+				local_seq_pairs.push_back(pair);
+			}
+		}
+		input_stream.close();
+		
+		// Process each sequence pair
+		for (size_t i = 0; i < local_seq_pairs.size(); i++) {
+			const SeqPair& pair = local_seq_pairs[i];
+			
+			// Calculate GC content locally
+			double local_GC[4] = {0, 0, 0, 0};
+			int j, k;
+			for(j=0; j<pair.full_seq.length(); j+=3) {
+				string codon = pair.full_seq.substr(j, 3);
+				for(k=0; k<3; k++) {
+					if(codon[k]=='G' || codon[k]=='C') local_GC[k+1]++;
+				}
+			}
+			if (pair.full_seq.length() > 0) {
+				local_GC[0] = (local_GC[1] + local_GC[2] + local_GC[3]) / pair.full_seq.length();
+				for(j=1; j<4; j++) local_GC[j] /= (pair.full_seq.length()/3);
+			}
+			
+			// Check validity locally
+			string valid_seq1 = pair.seq1;
+			string valid_seq2 = pair.seq2;
+			bool valid = true;
+			long idx;
+			
+			try {
+				if (valid_seq1.length() != valid_seq2.length() || valid_seq1.length()%3!=0 || valid_seq2.length()%3!=0) {
+					valid = false;
+				} else {
+					bool found;
+					int k;
+					for(idx=0; idx<valid_seq1.length(); idx+=3) {
+						for(found=false, k=0; k<3 && !found; k++) {
+							if (valid_seq1[idx+k]=='-' || valid_seq2[idx+k]=='-') {
+								found = true;
+							}
+							valid_seq1[idx+k] = toupper(valid_seq1[idx+k]);
+							valid_seq2[idx+k] = toupper(valid_seq2[idx+k]);
+							if (convertChar(valid_seq1[idx+k])==-1 || convertChar(valid_seq2[idx+k])==-1) {
+								found = true;
+							}
+						}
+						if ((getAminoAcid(valid_seq1.substr(idx,3))=='!') || (getAminoAcid(valid_seq2.substr(idx,3))=='!')) {
+							found = true;
+						}
+						if (found) {
+							valid_seq1 = valid_seq1.replace(idx, 3, "");
+							valid_seq2 = valid_seq2.replace(idx, 3, "");
+							idx -= 3;
+						}
+					}
+					if (valid_seq1.length() == 0) valid = false;
+				}
+			} catch (...) {
+				valid = false;
+			}
+			
+			if (valid) {
+				// Set global variables for calculation
+				for(int j = 0; j < 4; j++) GC[j] = local_GC[j];
+				length = valid_seq1.length();
+				seq_name = pair.name;
+				seq1 = valid_seq1;
+				seq2 = valid_seq2;
+				
+				// Close os to prevent calculateKaKs from writing
+				if (os.is_open()) {
+					os.close();
+				}
+				
+				result = "";
+				
+				// Perform calculation
+				if (calculateKaKs() && result.length() > 0) {
+					output_stream << result;
+				}
+			}
+		}
+		
+		output_stream.close();
+	}
+	catch (...) {
+		cerr << "Error in child process " << process_id << endl;
+	}
+}
+
 bool KAKS::ReadCalculateSeq(string filename) {
 
 	bool flag = true;	
@@ -156,38 +449,176 @@ bool KAKS::ReadCalculateSeq(string filename) {
 
 		showParaInfo();	//Show information on display
 		
-		result = getTitleInfo();//zhangyubin revised
-		
-		//Output stream
+		//Output stream - open and write title only once
 		if (output_filename!="" && output_filename.length()>0) {
-			os.open(output_filename.c_str());
-		//	os<<getTitleInfo();//zhangyubin revised
+			// Clear the file and write title
+			ofstream title_file(output_filename.c_str());
+			if (title_file.is_open()) {
+				title_file << getTitleInfo();
+				title_file.close();
+			} else {
+				cout << "Warning: Could not open output file for writing title" << endl;
+			}
+			// Only open os for sequential mode (parallel mode will write directly)
+			if (num_threads <= 1) {
+				os.open(output_filename.c_str(), ios::app);
+			}
 		}
 
+		// First pass: read all sequence pairs into memory
+		vector<SeqPair> seq_pairs;
 		string temp="", name="", str="";
 
 		while (getline(is, temp, '\n'))	{
-			
 			name = temp;			
 			
 			getline(is, temp, '\n');
+			str = "";
 			while (temp!="") {				
 				str += temp;
 				getline(is, temp, '\n');
 			}
 			
-			//Get GCC at three codon positions
-			getGCContent(str);
-			//Check str's validility and calculate
-			if (checkValid(name, str.substr(0, str.length()/2), str.substr(str.length()/2, str.length()/2))) {
-				cout<<++number<<" "<<name<<"\t";
-				if(!calculateKaKs()) throw 1;	//calculate Ka&Ks using selected method(s)
-				cout<<"[OK]"<<endl;
-			}			
-			name = str = "";
+			if (str.length() > 0) {
+				SeqPair pair;
+				pair.name = name;
+				pair.full_seq = str;
+				pair.seq1 = str.substr(0, str.length()/2);
+				pair.seq2 = str.substr(str.length()/2, str.length()/2);
+				seq_pairs.push_back(pair);
+			}
 		}
 		is.close();
-		is.clear();	
+		is.clear();
+		
+		// Initialize result - only for parallel mode (sequential mode already wrote header to file)
+		// In sequential mode, result should be empty initially since header is already in file
+		if (num_threads > 1) {
+			result = getTitleInfo();  // Parallel mode: result will be written by each thread
+		} else {
+			result = "";  // Sequential mode: header already in file, start with empty result
+		}
+		
+		// Parallel processing using multiple processes
+		if (num_threads > 1 && seq_pairs.size() > 1) {
+			int total_pairs = seq_pairs.size();
+			if (verbose) {
+				cout << "Total sequence pairs: " << total_pairs << ", using " << num_threads << " processes" << endl;
+			}
+			
+			// Divide tasks among processes
+			int pairs_per_process = (total_pairs + num_threads - 1) / num_threads;
+			
+			// Create temporary files for input and output
+			vector<string> input_files;
+			vector<string> output_files;
+			vector<pid_t> child_pids;
+			
+			// Create input files for each process
+			for (int p = 0; p < num_threads; p++) {
+				int start_idx = p * pairs_per_process;
+				int end_idx = std::min(start_idx + pairs_per_process, total_pairs);
+				
+				if (start_idx >= total_pairs) break;
+				
+				// Create temporary input file
+				stringstream ss_input;
+				ss_input << output_filename << ".input." << p << ".tmp";
+				string input_file = ss_input.str();
+				input_files.push_back(input_file);
+				
+				// Write sequence pairs to input file
+				ofstream input_stream(input_file.c_str());
+				if (!input_stream.is_open()) {
+					cout << "Error: Could not create input file " << input_file << endl;
+					throw 1;
+				}
+				
+				for (int i = start_idx; i < end_idx; i++) {
+					input_stream << seq_pairs[i].name << "\n";
+					input_stream << seq_pairs[i].full_seq << "\n\n";
+				}
+				input_stream.close();
+				
+				// Create temporary output file name
+				stringstream ss_output;
+				ss_output << output_filename << ".output." << p << ".tmp";
+				string output_file = ss_output.str();
+				output_files.push_back(output_file);
+			}
+			
+			// Fork child processes
+			for (int p = 0; p < num_threads && p * pairs_per_process < total_pairs; p++) {
+				pid_t pid = fork();
+				
+				if (pid == 0) {
+					// Child process: process the assigned sequence pairs
+					processChildTask(input_files[p], output_files[p], p);
+					exit(0);
+				} else if (pid > 0) {
+					// Parent process: record child PID
+					child_pids.push_back(pid);
+				} else {
+					// Fork failed
+					cout << "Error: Failed to fork process " << p << endl;
+					throw 1;
+				}
+			}
+			
+			// Wait for all child processes to complete
+			for (size_t i = 0; i < child_pids.size(); i++) {
+				int status;
+				waitpid(child_pids[i], &status, 0);
+				if (verbose && WIFEXITED(status)) {
+					cout << "Process " << i << " completed with status " << WEXITSTATUS(status) << endl;
+				}
+			}
+			
+			// Collect results from all output files and write to final output in order
+			if (output_filename.length() > 0) {
+				ofstream final_output(output_filename.c_str(), ios::app);
+				if (final_output.is_open()) {
+					for (size_t p = 0; p < output_files.size(); p++) {
+						ifstream result_stream(output_files[p].c_str());
+						if (result_stream.is_open()) {
+							// Read entire file content
+							stringstream buffer;
+							buffer << result_stream.rdbuf();
+							string content = buffer.str();
+							final_output << content;
+							result_stream.close();
+							// Remove temporary output file
+							remove(output_files[p].c_str());
+						}
+						// Remove temporary input file
+						remove(input_files[p].c_str());
+					}
+					final_output.flush();
+					final_output.close();
+				}
+			}
+			
+			number = total_pairs;
+			if (verbose) {
+				cout << "All processes completed. Total processed: " << number << endl;
+			}
+		} else {
+			// Sequential processing (original behavior)
+			for (size_t i = 0; i < seq_pairs.size(); i++) {
+			const SeqPair& pair = seq_pairs[i];
+			getGCContent(pair.full_seq);
+			if (checkValid(pair.name, pair.seq1, pair.seq2)) {
+				number++;
+				if (verbose) {
+					cout<<number<<"  "<<pair.name<<"\t";
+				}
+				if(!calculateKaKs()) throw 1;
+				if (verbose) {
+					cout<<"[OK]"<<endl;
+				}
+			}
+			}
+		}
 
 	}
 	catch (...) {		
@@ -369,6 +800,26 @@ bool KAKS::parseParameter(int argc, const char* argv[]) {
 						throw 1;
 					}
 				}
+				//Number of threads/CPUs for parallel computation
+				else if (temp=="-P" || temp=="-T") {
+					if ((i+1)<argc) {
+						num_threads = CONVERT<int>(argv[++i]);
+						if (num_threads < 1) {
+							num_threads = 1;
+						}
+						// Limit to reasonable number
+						if (num_threads > 128) {
+							num_threads = 128;
+						}
+					}
+					else {
+						throw 1;
+					}
+				}
+				//Verbose mode: output each pair information
+				else if (temp=="-V") {
+					verbose = true;
+				}
 				//Details for Model Selection
 				else if (temp=="-D") {
 					if ((i+1)>argc) throw 1;
@@ -506,12 +957,12 @@ if ((!myn)&&(!ng86)&&(!lwl85)&&(!mlwl85)&&(!lpb93)&&(!mlpb93)&&(!yn00))//||(gmlp
 {
 	if (tempt==0)
 	{
-result = getTitleInfo();//for Gamma choice¡¯s result delete the first line 
+result = getTitleInfo();//for Gamma choiceï¿½ï¿½s result delete the first line 
 //Linux version don't need this line
 tempt++;
 	} 	else
 	{
-result = "";//for Gamma choice¡¯s result delete the first line 
+result = "";//for Gamma choiceï¿½ï¿½s result delete the first line 
 	}
 
 
@@ -577,7 +1028,11 @@ if (fkaks<1)
 			os<<result;
 			os.flush();
 		}
-		result = "";
+		// Only clear result if we wrote it to file (sequential mode)
+		// In parallel mode, os is closed, so we keep result for the caller
+		if (os.is_open()) {
+			result = "";
+		}
 	}
 	catch (...) {
 		flag = false;
@@ -715,6 +1170,9 @@ void KAKS::showParaInfo() {
 	if (ma) 	cout<<"MA";
 
 	cout<<endl<<"Genetic code: "<<transl_table[2*(genetic_code-1)+1]<<endl;
+	if (num_threads > 1) {
+		cout<<"Parallel computation: using "<<num_threads<<" threads"<<endl;
+	}
 	cout<<"Please wait while reading sequences and calculating..."<<endl;
 }
 
@@ -760,6 +1218,8 @@ void KAKS::helpInfo() {
 	cout<<"\t-i\tAxt file name for calculating Ka & Ks."<<endl;
 	cout<<"\t-o\tOutput file name for saving results."<<endl;
 	cout<<"\t-c\tGenetic code table (Default = 1-Standard Code)."<<endl;
+	cout<<"\t-p\tNumber of threads/CPUs for parallel computation (Default = 1, use -p 8 for 8 threads)."<<endl;
+	cout<<"\t-v\tVerbose mode: output each pair information during calculation (Default = off)."<<endl;
 	for(i=0,j=0; i<NNCODE; i+=2) { 
 		if(strlen(transl_table[i])>0) {
 			cout<<"\t\t  "<<transl_table[i+1]<<"\t";
@@ -785,6 +1245,7 @@ void KAKS::helpInfo() {
 
 
 	cout<<"\t./KaKs_Calculator -i test.axt -o test.axt.kaks -m GMYN\t//use Gamma-MYN method"<<endl;
+	cout<<"\t./KaKs_Calculator -i test.axt -o test.axt.kaks -m YN -p 8\t//use YN method with 8 threads"<<endl;
 
 /*	cout<<"\tKaKs_Calculator -i test.axt -o test.axt.kaks\t//use MA method based on a more suitable model and standard code"<<endl;
 	cout<<"\tKaKs_Calculator -i test.axt -o test.axt.kaks -c 2\t//use MA method and vertebrate mitochondrial code"<<endl;
