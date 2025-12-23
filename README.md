@@ -1,3 +1,5 @@
+## Modification note: Added multi-process support (via-p)
+
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.4273737.svg)](https://doi.org/10.5281/zenodo.4273737)
 [![Anaconda-Server Badge](https://anaconda.org/bioconda/kakscalculator2/badges/installer/conda.svg)](https://conda.anaconda.org/bioconda)
 [![Anaconda-Server Badge](https://anaconda.org/bioconda/kakscalculator2/badges/downloads.svg)](https://anaconda.org/bioconda/kakscalculator2)
